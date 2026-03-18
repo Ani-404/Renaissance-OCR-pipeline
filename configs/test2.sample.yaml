@@ -1,0 +1,21 @@
+pipeline:
+  data_dir: data
+  pdf_dir: data/handwritten
+  gt_dir: data/ground_truth
+  out_dir: outputs/test2
+  task: test2
+  ocr_backend: pypdf_text
+  use_llm: true
+  model_name: handwritten_vlm_pipeline
+  max_pages: 2
+  dpi: 300
+  main_text_strategy: center_crop
+  main_text_margin: 0.08
+  llm_every_stage: true
+  use_ocr_prior: true
+  save_page_outputs: true
+
+llm:
+  api_key_env: OPENAI_API_KEY
+  model: gpt-4.1-mini
+  temperature: 0.0
