@@ -24,6 +24,9 @@ class PipelineConfig:
     llm_every_stage: bool = False
     use_ocr_prior: bool = False
     save_page_outputs: bool = True
+    # Confidence score threshold below which a document is treated as degraded.
+    # Passed through to LLMCleaner; range [0.0, 1.0], default 0.5.
+    confidence_threshold: float = 0.5
 
 
 @dataclass
@@ -59,6 +62,7 @@ def load_pipeline_config(path: str | Path) -> tuple[PipelineConfig, LLMConfig]:
         llm_every_stage=bool(pipe.get("llm_every_stage", False)),
         use_ocr_prior=bool(pipe.get("use_ocr_prior", False)),
         save_page_outputs=bool(pipe.get("save_page_outputs", True)),
+        confidence_threshold=float(pipe.get("confidence_threshold", 0.5)),
     )
 
     llm_cfg = LLMConfig(

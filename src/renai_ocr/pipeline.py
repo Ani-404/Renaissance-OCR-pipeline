@@ -26,7 +26,16 @@ def run_test1(cfg: PipelineConfig, llm_cfg: LLMConfig) -> dict:
     cfg.out_dir.mkdir(parents=True, exist_ok=True)
 
     ocr = build_backend(cfg.ocr_backend)
-    cleaner = LLMCleaner(llm_cfg.api_key_env, llm_cfg.model, llm_cfg.temperature) if cfg.use_llm else None
+    cleaner = (
+        LLMCleaner(
+            llm_cfg.api_key_env,
+            llm_cfg.model,
+            llm_cfg.temperature,
+            cfg.confidence_threshold,
+        )
+        if cfg.use_llm
+        else None
+    )
 
     cers, wers, ncers, nwers = [], [], [], []
     records = []
@@ -34,20 +43,26 @@ def run_test1(cfg: PipelineConfig, llm_cfg: LLMConfig) -> dict:
     for pdf in tqdm(list_pdfs(cfg.pdf_dir), desc="Test I PDFs"):
         if cfg.ocr_backend.lower() == "pypdf_text":
             page_predictions = extract_pdf_text_pages(pdf, max_pages=cfg.max_pages)
+            page_confidences = [1.0] * len(page_predictions)  # native PDF text is always clean
             pages_len = len(page_predictions)
         else:
             pages = pdf_to_images(pdf, dpi=cfg.dpi, max_pages=cfg.max_pages)
             page_predictions = []
+            page_confidences = []
             for idx, page in enumerate(pages, start=1):
                 processed = extract_main_text_region(page, cfg.main_text_strategy, cfg.main_text_margin)
-                raw = ocr.infer_text(processed)
+                raw, conf = ocr.infer_with_confidence(processed)
                 page_predictions.append(raw)
+                page_confidences.append(conf)
                 if cfg.save_page_outputs:
                     (cfg.out_dir / f"{pdf.stem}.page_{idx:03d}.raw.txt").write_text(raw, encoding="utf-8")
             pages_len = len(pages)
 
         raw_text = "\n".join(page_predictions)
-        final_text = cleaner.clean_printed_ocr(raw_text) if cleaner else raw_text
+        # Use the mean page confidence as the document-level confidence signal.
+        doc_confidence = float(sum(page_confidences) / len(page_confidences)) if page_confidences else 1.0
+
+        final_text = cleaner.clean_printed_ocr(raw_text, ocr_confidence=doc_confidence) if cleaner else raw_text
 
         gt_file = _gt_path(cfg.gt_dir, pdf)
         if gt_file.exists():
@@ -67,6 +82,8 @@ def run_test1(cfg: PipelineConfig, llm_cfg: LLMConfig) -> dict:
             "source": pdf.name,
             "num_pages": pages_len,
             "chars": len(final_text),
+            "ocr_confidence": round(doc_confidence, 4),
+            "degraded": doc_confidence < cfg.confidence_threshold,
             "cer": c,
             "wer": w,
             "normalized_cer": nc,
@@ -82,6 +99,7 @@ def run_test1(cfg: PipelineConfig, llm_cfg: LLMConfig) -> dict:
         "model": cfg.model_name,
         "ocr_backend": cfg.ocr_backend,
         "llm_enabled": cfg.use_llm,
+        "confidence_threshold": cfg.confidence_threshold,
         "summary": summary,
         "records": records,
     }
@@ -92,7 +110,12 @@ def run_test1(cfg: PipelineConfig, llm_cfg: LLMConfig) -> dict:
 def run_test2(cfg: PipelineConfig, llm_cfg: LLMConfig) -> dict:
     cfg.out_dir.mkdir(parents=True, exist_ok=True)
 
-    cleaner = LLMCleaner(llm_cfg.api_key_env, llm_cfg.model, llm_cfg.temperature)
+    cleaner = LLMCleaner(
+        llm_cfg.api_key_env,
+        llm_cfg.model,
+        llm_cfg.temperature,
+        cfg.confidence_threshold,
+    )
     ocr = None
     if cfg.use_ocr_prior and cfg.ocr_backend.lower() not in {"none", "disabled"}:
         ocr = build_backend(cfg.ocr_backend)
@@ -105,15 +128,22 @@ def run_test2(cfg: PipelineConfig, llm_cfg: LLMConfig) -> dict:
         pdf_text_prior = extract_pdf_text_pages(pdf, max_pages=cfg.max_pages) if cfg.ocr_backend.lower() == "pypdf_text" else []
 
         page_texts = []
+        page_confidences = []
         for idx, page in enumerate(pages, start=1):
             processed = extract_main_text_region(page, cfg.main_text_strategy, cfg.main_text_margin)
             encoded = pil_to_base64_png(processed)
 
             page_analysis = cleaner.analyze_handwritten_page(encoded) if cfg.llm_every_stage else ""
+
             if cfg.ocr_backend.lower() == "pypdf_text":
                 ocr_prior = pdf_text_prior[idx - 1] if idx - 1 < len(pdf_text_prior) else ""
+                ocr_conf = 1.0
+            elif ocr:
+                ocr_prior, ocr_conf = ocr.infer_with_confidence(processed)
             else:
-                ocr_prior = ocr.infer_text(processed) if ocr else ""
+                ocr_prior, ocr_conf = "", 0.0
+
+            page_confidences.append(ocr_conf)
 
             page_draft = cleaner.transcribe_handwriting_page(encoded, page_analysis=page_analysis, ocr_prior=ocr_prior)
             context = "\n".join(page_texts[-2:]) if page_texts else ""
@@ -123,13 +153,15 @@ def run_test2(cfg: PipelineConfig, llm_cfg: LLMConfig) -> dict:
             if cfg.save_page_outputs:
                 stage_text = (
                     f"# analysis\n{page_analysis}\n\n"
-                    f"# ocr_prior\n{ocr_prior}\n\n"
+                    f"# ocr_prior (confidence={ocr_conf:.3f})\n{ocr_prior}\n\n"
                     f"# page_final\n{page_final}\n"
                 )
                 (cfg.out_dir / f"{pdf.stem}.page_{idx:03d}.stages.txt").write_text(stage_text, encoding="utf-8")
 
         source_draft = "\n".join(page_texts)
         final_text = cleaner.finalize_handwritten_source(source_draft)
+
+        doc_confidence = float(sum(page_confidences) / len(page_confidences)) if page_confidences else 0.0
 
         gt_file = _gt_path(cfg.gt_dir, pdf)
         if gt_file.exists():
@@ -149,6 +181,8 @@ def run_test2(cfg: PipelineConfig, llm_cfg: LLMConfig) -> dict:
             "source": pdf.name,
             "num_pages": len(pages),
             "chars": len(final_text),
+            "ocr_confidence": round(doc_confidence, 4),
+            "degraded": doc_confidence < cfg.confidence_threshold,
             "cer": c,
             "wer": w,
             "normalized_cer": nc,
@@ -166,6 +200,7 @@ def run_test2(cfg: PipelineConfig, llm_cfg: LLMConfig) -> dict:
         "model": cfg.model_name,
         "ocr_backend": cfg.ocr_backend,
         "llm_enabled": True,
+        "confidence_threshold": cfg.confidence_threshold,
         "summary": summary,
         "records": records,
     }
